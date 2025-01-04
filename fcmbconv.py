@@ -39,48 +39,12 @@ def set_serial(cfg : dict, fc_cfg : dict)-> None:
     fc_cfg["tag"] = fc_cfg["tag"] + ",\n" +  ("ascii=true," if is_ascii else "")
 
 
-def get_device_cfg(cfg : dict)->dict | None:
-    dev_cfg : dict = {"enable" : cfg["enable"], "name" : cfg["name"],
-                      "description" : cfg["description"], "instance" : cfg["instance"]}
-    tag : str = "slave=" + str(cfg["station"]) + ",\ntimeout=" + str(cfg["timeout_ms"])
-    if cfg.get("single_write_coil"):
-        tag = tag + ",\nwritesinglecoil=true"
-
-    if cfg.get("single_write_reg"):
-        tag = tag + ",\nwritesinglereg=true"
-
-    byte_reverse : bool = cfg["byte_reverse"]
-    integer_byte_reverse : bool = cfg["integer_byte_reverse"]
-    float_byte_reverse : bool = cfg["float_byte_reverse"]
-    integer_little_endian : bool = cfg["integer_little_endian"]
-    float_little_endian : bool = cfg["float_little_endian"]
-
-    if byte_reverse != integer_byte_reverse or byte_reverse != float_byte_reverse:
-        messagebox.showerror(None, "Byte order for single register|big integer|float is not consistent")
-        return None
-
-    if integer_little_endian != float_little_endian:
-        messagebox.showerror(None, "Byte order for bit integer|float is not consistent")
-        return None
-
-    if byte_reverse:
-        if integer_little_endian:
-            tag = tag + ",\nendian=1"
-        else:
-            tag = tag + ",\nendian=3"
-    else:
-        if integer_little_endian:
-            tag = tag + ",\nendian=2"
-        else:
-            tag = tag + ",\nendian=4"
-
-    dev_cfg["tag"] = tag
-    return dev_cfg
-
-
-def set_points(points : list[dict], dev_cfg : dict)->list[(int, int, int)]:
+def set_points(points : list[dict], dev_cfg : dict)->tuple[list[(int, int, int)], tuple[bool, bool, bool]]:
     """after set dev_cfg, return list of (func_code, 0 based start address, data length)"""
     used_address : list[(int, int, int)] = []
+    single_reg : bool = False
+    bigint_reg : bool = False
+    float_reg : bool = False;
     fcpoints : list[dict] = []
     dev_cfg["fcpoints"] = fcpoints
 
@@ -119,6 +83,7 @@ def set_points(points : list[dict], dev_cfg : dict)->list[(int, int, int)]:
                 fcpnt["state_texts"] = pnt["state_texts"]
             if func_code >= 3:  #register
                 tag = tag + ",\nbit=" + str(pnt["bit_offset"])
+                single_reg = True
             datalen = 1
         elif object_type[0] == "a":   #analog
             fcpnt["unit"] = pnt["unit"]
@@ -139,17 +104,24 @@ def set_points(points : list[dict], dev_cfg : dict)->list[(int, int, int)]:
                 tag = tag + ",\ndatatype=\"" + datatype + "\",\noffset="\
                       + str(pnt["offset"]) + ",\nscale=" + str(pnt["scale"])
                 if datalen == 1:
+                    single_reg = True
                     if "bit_offset" in pnt:
                         tag = tag + ",\nbit=" + str(pnt["bit_offset"])
                     if "bit_len" in pnt:
                         tag = tag + ",\nbit_len=" + str(pnt["bit_len"])
+                elif datatype[0] == "f":
+                    float_reg = True
+                else:
+                    bigint_reg = True
         else:
             #multistate
             if "reg_num" in pnt and pnt["reg_num"] > 1:
                 datalen = 2
                 tag = tag + ",\ndatatype=\"u32\""
+                bigint_reg = True
             else:
                 datalen = 1
+                single_reg = True
                 if "bit_offset" in pnt:
                     tag = tag + ",\nbit=" + str(pnt["bit_offset"])
                 if "bit_len" in pnt:
@@ -172,10 +144,10 @@ def set_points(points : list[dict], dev_cfg : dict)->list[(int, int, int)]:
         if enable:
             used_address.append((func_code, address, datalen))
 
-    return used_address
+    return used_address, (single_reg, bigint_reg, float_reg)
 
 
-def set_readreqs(cfg : dict, dev_cfg : dict, used_address : list[(int, int, int)])->None:
+def get_readreqs(cfg : dict, used_address : list[(int, int, int)])->str:
     readreqs : list[(int, int ,int)] = []
     used_address.sort(key = lambda pnt : pnt[0] * 100000 + pnt[1] - pnt[2]*0.0001)
 
@@ -209,12 +181,69 @@ def set_readreqs(cfg : dict, dev_cfg : dict, used_address : list[(int, int, int)
     if prev is not None:
         readreqs.append(prev)
 
-    tag : str = dev_cfg["tag"]
-    tag = tag + ",\nreadreqs={"
+    tag : str = "readreqs={"
     for req in readreqs:
         tag = tag + "\n{" + str(req[0]) + ", " + str(req[1]) + ", " + str(req[2]) + "},"
     tag = tag + "\n}"
-    dev_cfg["tag"] = tag
+    return tag
+
+
+def get_endian(cfg : dict, regs: tuple[bool, bool, bool]) -> str | None:
+    single_reg, bigint_reg, float_reg = regs
+    byte_reverse : bool = cfg["byte_reverse"]
+    integer_byte_reverse : bool = cfg["integer_byte_reverse"]
+    float_byte_reverse : bool = cfg["float_byte_reverse"]
+    integer_little_endian : bool = cfg["integer_little_endian"]
+    float_little_endian : bool = cfg["float_little_endian"]
+
+    if single_reg:
+        if bigint_reg and byte_reverse != integer_byte_reverse:
+            messagebox.showerror(None, "Byte order for single register|big integer is not consistent")
+            return None
+
+        if float_reg and byte_reverse != float_byte_reverse:
+            messagebox.showerror(None, "Byte order for single register|float is not consistent")
+            return None
+
+    if bigint_reg and float_reg:
+        if integer_byte_reverse != float_byte_reverse or integer_little_endian != float_little_endian:
+            messagebox.showerror(None, "Byte order for bit integer|float is not consistent")
+            return None
+
+    tag : str
+    if byte_reverse if single_reg else integer_byte_reverse if bigint_reg else float_byte_reverse if float_reg else False:
+        if integer_little_endian if bigint_reg else float_little_endian if float_reg else True:
+            tag = "endian=1"
+        else:
+            tag = "endian=3"
+    else:
+        if integer_little_endian if bigint_reg else float_little_endian if float_reg else False:
+            tag = "endian=2"
+        else:
+            tag = "endian=4"
+
+    return tag
+
+
+def get_device_cfg(cfg : dict)->dict | None:
+    dev_cfg : dict = {"enable" : cfg["enable"], "name" : cfg["name"],
+                      "description" : cfg["description"], "instance" : cfg["instance"]}
+    tag : str = "slave=" + str(cfg["station"]) + ",\ntimeout=" + str(cfg["timeout_ms"])
+    if cfg.get("single_write_coil"):
+        tag = tag + ",\nwritesinglecoil=true"
+
+    if cfg.get("single_write_reg"):
+        tag = tag + ",\nwritesinglereg=true"
+
+    used_address, regs = set_points(cfg.get("points"), dev_cfg)
+    readreqs : str = get_readreqs(cfg, used_address)
+
+    endian : str = get_endian(cfg, regs)
+    if endian is None:
+        return None
+
+    dev_cfg["tag"] = tag + ",\n" + endian + ",\n" + readreqs
+    return dev_cfg
 
 
 def main():
@@ -263,14 +292,18 @@ def main():
 
     script_name: str = os.path.basename(filepath)
 
+    cfgdir : str = "~/"
+
     while 1:
         filepath = filedialog.askopenfilename(
-            initialdir = "~/",
+            initialdir = cfgdir,
             title = "Select a config file",
             filetypes = (("Modbus device config file", "*.json"), ("All files", "*.*")))
 
         if not filepath:
             return 0
+
+        cfgdir = os.path.dirname(filepath)
 
         try:
             with open(filepath, 'r', encoding='utf-8-sig') as file:
@@ -293,8 +326,7 @@ def main():
             messagebox.showerror(None, "Not a json objects")
             continue
 
-        points : list[dict] = cfg.get("points")
-        if not isinstance(points, list):
+        if not isinstance(cfg.get("points"), list):
             messagebox.showerror(None, "Invalid points arrays, is it a Modbus device config file?")
             continue
 
@@ -310,15 +342,11 @@ def main():
             continue
 
         fc_cfg["fcdevices"] = [dev_cfg]
-        used_address = set_points(points, dev_cfg)
-        set_readreqs(cfg, dev_cfg, used_address)
         break
-
-    srcdir : str = os.path.dirname(filepath)
 
     while 1:
         filepath = filedialog.asksaveasfilename(
-            initialdir = srcdir,
+            initialdir = cfgdir,
             title = "Save converted config to file",
             defaultextension=".json",
             filetypes = (("FreeClient bus config file", "*.json"), ("All files", "*.*")))
