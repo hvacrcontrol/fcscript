@@ -67,7 +67,6 @@
 --  ms_values: array of integer, only valid to multisate object
 --      if ms_values is absense, BACnet present value 1 mapping to Modbus 0
 --      if ms_values is present, BACnet present value 1 mapping to ms_values[1]
---  polarity: only valid for binary object, true=inverse, false=normal(default)
 --  bit: 0~15, default is 0. Only valid for binary on input/holding register
 --      or multistate object with "u16" datatype or analog object with
 --      "u16" or "s16" datatype
@@ -458,7 +457,10 @@ function timer_callback(ctx)
         end
     end
 
-    if value == last_value then goto continue end
+    if value == last_value then
+        point.last_output = value
+        goto continue
+    end
 
     local output = point.output == nil and default_output or point.output
 
@@ -471,9 +473,9 @@ function timer_callback(ctx)
         and default_postoutput or point.postoutput
 
     local output_value = postoutput(device, point, value, output_reqs)
+    point.last_output = output_value
     if output_value == last_value then goto continue end
 
-    point.last_output = output_value
     ctx.err_cnt = 0
     send_write_request(ctx, device, point, output_reqs)
 end
@@ -511,7 +513,10 @@ local function scan_commandable(ctx, devidx, start)
                 device.curr_scanidx)
         if last_reliability ~= 0 then last_value = nil end
 
-        if value == last_value then goto continue end
+        if value == last_value then
+            point.last_output = value
+            goto continue
+        end
 
         local output = point.output == nil and default_output or point.output
 
@@ -522,9 +527,9 @@ local function scan_commandable(ctx, devidx, start)
             and default_postoutput or point.postoutput
 
         local output_value = postoutput(device, point, value, output_reqs)
+        point.last_output = output_value
         if output_value == last_value then goto continue end
 
-        point.last_output = output_value
         ctx.err_cnt = 0
         send_write_request(ctx, device, point, output_reqs)
         do return true end
@@ -559,6 +564,10 @@ local function write_callback(ctx, result, data)
     if result < 0 then
         if ctx.type ~= swg.interface_rs485 then swg.tcpreset() end
 
+        print("Write failed(" .. result .. ") slave "
+                .. ctx.curr_comm.device.slave .. " func code "
+                .. ctx.curr_comm.func_code .. " addr "
+                .. ctx_curr_comm.addr)
         ctx.err_cnt = ctx.err_cnt + 1
         if ctx.err_cnt < max_err_cnt then
             send_request(ctx, ctx.curr_comm.packet, ctx.curr_comm.device.timeout)
@@ -608,6 +617,8 @@ local function read_callback(ctx, result, data)
     if result < 0 then
         if ctx.type ~= swg.interface_rs485 then swg.tcpreset() end
 
+        print("Read failed(" .. result .. ") on device " .. ctx.curr_devidx
+                .. " request " .. ctx.curr_reqidx)
         ctx.err_cnt = ctx.err_cnt + 1
         if device.fail_ts or ctx.err_cnt >= max_err_cnt then
             device.fail_ts = swg.now()  --flags for offline
@@ -866,8 +877,6 @@ function default_input(device, point)
         else
             value = (value:byte(1,1) & 1) ~= 0
         end
-
-        if point.tag.polarity then value = not value end
     else
         value = getmodbusdata(device.readreqs, point.tag.func_code,
                 point.tag.addr, (point.tag.bitlen + 15) // 16)
@@ -960,8 +969,6 @@ function default_output(device, point, value)
     end
 
     if point.obj_type == "b" then
-        if point.tag.polarity then value = not value end
-
         if point.tag.func_code >= 3 then
             last = last & ~(1 << point.tag.bit)
             if value then last = last + (1 << point.tag.bit) end
@@ -1287,7 +1294,7 @@ local function init(ctx)
         elseif ctx.ascii then
             ctx.before_idle = 0
         else
-            ctx.before_ms = 1000 / ctx.baudrate * 11 * 3.5
+            ctx.before_idle = 1000 / ctx.baudrate * 11 * 3.5
         end
     end
 
