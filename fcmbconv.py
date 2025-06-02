@@ -39,14 +39,18 @@ def set_serial(cfg : dict, fc_cfg : dict)-> None:
     fc_cfg["tag"] = fc_cfg["tag"] + ",\n" +  ("ascii=true," if is_ascii else "")
 
 
-def set_points(points : list[dict], dev_cfg : dict)->tuple[list[(int, int, int)], tuple[bool, bool, bool]]:
-    """after set dev_cfg, return list of (func_code, 0 based start address, data length)"""
+def set_points(cfg : dict, dev_cfg : dict)->tuple[list[(int, int, int)], tuple[bool, bool, bool]]:
+    """after set dev_cfg, return list of (func_code, 0 based start address, data length),
+     (has_single_register, has_big_integer_register, has_float_point_register)"""
     used_address : list[(int, int, int)] = []
     single_reg : bool = False
     bigint_reg : bool = False
-    float_reg : bool = False;
+    float_reg : bool = False
     fcpoints : list[dict] = []
     dev_cfg["fcpoints"] = fcpoints
+    points : list[dict] = cfg.get("points")
+    coil_fr_discrete : bool = bool(cfg.get("coil_fr_discrete"))
+    holding_fr_input : bool = bool(cfg.get("holding_fr_input"))
 
     for pnt in points:
         fcpnt = {"name" : pnt["name"], "description" : pnt["description"],
@@ -66,16 +70,31 @@ def set_points(points : list[dict], dev_cfg : dict)->tuple[list[(int, int, int)]
             func_code = 4
         elif pnt["address_type"] == "coil":
             func_code = 1
-        else:
+        else:   #discrete
             func_code = 2
 
+        need_output : bool = False
         if object_type[1]  == "v":
             if func_code == 1 or func_code == 3:
+                need_output = True
                 fcpnt["value_type"] = 0
             else:
                 fcpnt["value_type"] = 1
+        elif object_type[1] == "o":
+            need_output = True
+
+        force_output : bool = False
+        if coil_fr_discrete and func_code == 1:
+            func_code = 2
+            force_output = need_output
+        elif holding_fr_input and func_code == 3:
+            func_code = 4
+            force_output = need_output
 
         tag : str = "func_code=" + str(func_code) + ",\naddr=" + str(address)
+        if force_output:
+            tag = tag + ",\noutput=default_output"
+
         datalen : int
         if object_type[0] == "b":     #binary
             fcpnt["polarity"] = pnt["polarity"]
@@ -147,6 +166,15 @@ def set_points(points : list[dict], dev_cfg : dict)->tuple[list[(int, int, int)]
     return used_address, (single_reg, bigint_reg, float_reg)
 
 
+def search_max_register(used_address : list[(int, int, int)])->int:
+    max_len : int = 1
+    for pnt in used_address:
+        if pnt[0] > 2 and pnt[2] > max_len:
+            max_len = pnt[2]
+
+    return max_len
+
+
 def get_readreqs(cfg : dict, used_address : list[(int, int, int)])->str:
     readreqs : list[(int, int ,int)] = []
     used_address.sort(key = lambda pnt : pnt[0] * 100000 + pnt[1] - pnt[2]*0.0001)
@@ -155,6 +183,9 @@ def get_readreqs(cfg : dict, used_address : list[(int, int, int)])->str:
     unused_bit : int = cfg["unused_bit"]
     group_reg : int = cfg["group_reg"]
     unused_reg : int = cfg["unused_reg"]
+    max_regs = search_max_register(used_address)
+    if max_regs > group_reg:
+        group_reg = max_regs
 
     prev : tuple[int, int, int] | None = None
     for pnt in used_address:
@@ -235,7 +266,7 @@ def get_device_cfg(cfg : dict)->dict | None:
     if cfg.get("single_write_reg"):
         tag = tag + ",\nwritesinglereg=true"
 
-    used_address, regs = set_points(cfg.get("points"), dev_cfg)
+    used_address, regs = set_points(cfg, dev_cfg)
     readreqs : str = get_readreqs(cfg, used_address)
 
     endian : str = get_endian(cfg, regs)
