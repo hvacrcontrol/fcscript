@@ -1,4 +1,4 @@
---Modbus v2.00, supports Modbus RTU, ASCII, TCP, RTU over TCP
+--Modbus v2.01, supports Modbus RTU, ASCII, TCP, RTU over TCP
 --Tag config:
 --bus:
 --  update_interval: milliseconds, default is 10000(10 seconds)
@@ -139,7 +139,8 @@ end
 local function decode_ascii(input)
     --return decode packet
 
-    local input, count = string.gsub(input, "^:+", "")
+    local count
+    input, count = string.gsub(input, "^:+", "")
     if count == 0 then return nil end
 
     local cridx = string.find(input, "\r\n")
@@ -267,16 +268,75 @@ local function check_write_multi_rsp(packet, slave, func_code, start_addr, quant
 end
 
 
-local function printpacket(packet, result)
+local exception_msg = {[1] = "1-illegal function",
+    [2] = "2-illegal data address",
+    [3] = "3-illegal data value",
+    [4] = "4-server device failure",
+    [5] = "5-ackownledge",
+    [6] = "6-server device busy",
+    [8] = "8-memory parity error",
+    [10] = "10-gateway path unavailable",
+    [11] = "11-gateway target devcie failed to respond" }
+
+
+local function getExceptionMsg(code)
+    local err = exception_msg[code]
+    if err == nil then
+        string.format("%d", code)
+    end
+
+    return "Exception:" .. err
+end
+
+
+local function getRS485ErrorMsg(result)
+    if result == -1 then return "bus mess"
+    elseif result == -2 then return "timeout"
+    elseif result == -3 then return "byte error"
+    elseif result == -5 then return "packet overflow"
+    else return string.format("%d", result) end
+end
+
+
+local function getTCPErrorMsg(result)
+    if result == -1 then return "connect timeout"
+    elseif result == -2 then return "read failed"
+    elseif result == -3 then return "write failed"
+    elseif result == -4 then return "connect failed"
+    else return string.format("%d", result) end
+end
+
+
+local function printTxPacket(packet)
+    local output = {}
+    local head = "Tx:"
+
+    table.insert(output, head)
+    local char_cnt = #head
+
+    for i=1, #packet do
+        if char_cnt > 120 then
+            print(table.concat(output, " "))
+            output = {}
+            char_cnt = 2
+        else
+            char_cnt = char_cnt + 3
+        end
+        table.insert(output, string.format("%02x", string.byte(packet,i,i)))
+    end
+    print(table.concat(output, " "))
+end
+
+
+local function printRxPacket(packet, err)
     local output = {}
     local head
-    if result == nil then
-        head = "Tx:"
-    elseif result < 0 then
-        head = "Rx(" .. result .. "):"
-    else
+    if err == nil then
         head = "Rx:"
+    else
+        head = "Rx(" .. err .. "):"
     end
+
     table.insert(output, head)
     local char_cnt = #head
 
@@ -325,7 +385,7 @@ local function send_request(ctx, packet, timeout)
     end
 
     if ctx.debug then
-        printpacket(packet, nil)
+        printTxPacket(packet)
     end
 end
 
@@ -451,9 +511,10 @@ function timer_callback(ctx)
     if point.last_output ~= nil then
         last_value = point.last_output
     else
-        local value, reliability = swg.pointvalue(devidx, pntidx)
-        if reliability == 0 then
-            last_value = value
+        local reliability
+        last_value, reliability = swg.pointvalue(devidx, pntidx)
+        if reliability ~= 0 then
+            last_value = nil
         end
     end
 
@@ -484,6 +545,7 @@ end
 local function scan_commandable(ctx, devidx, start)
     --For commandable object, when value readback doesnot match value outputed,
     --we need to output again.
+    --return true if output is ongoing, false if no work to do
     local device = ctx.devices[devidx]
     local now = swg.now()
 
@@ -541,12 +603,12 @@ local function scan_commandable(ctx, devidx, start)
 end
 
 
-local function write_callback(ctx, result, data)
-    if result >= 0 then
-        if check_exception(data, ctx.curr_comm.device.slave, ctx.curr_comm.func_code) ~= nil then
-            result = 0  --regards it as success
+local function write_callback(ctx, err, data)
+    if err == nil then
+        local exception = check_exception(data, ctx.curr_comm.device.slave, ctx.curr_comm.func_code)
+        if exception ~= nil then
+            err = getExceptionMsg(exception)
         else
-            local err
             if ctx.curr_comm.func_code < 15 then
                 err = check_write_single_rsp(data, ctx.curr_comm.device.slave,
                     ctx.curr_comm.func_code, ctx.curr_comm.addr)
@@ -554,20 +616,24 @@ local function write_callback(ctx, result, data)
                 err = check_write_multi_rsp(data, ctx.curr_comm.device.slave,
                     ctx.curr_comm.func_code, ctx.curr_comm.addr, ctx.curr_comm.quantity)
             end
-            if err then
-                result = -100
-                ctx.err_cnt = max_err_cnt
-            end
+        end
+
+        if err ~= nil then
+            print("Write failed(" .. err .. ") slave "
+                    .. ctx.curr_comm.device.slave .. " func code "
+                    .. ctx.curr_comm.func_code .. " addr "
+                    .. ctx.curr_comm.addr)
+            err = nil --regards it as success to avoid retry
         end
     end
 
-    if result < 0 then
+    if err ~= nil then
         if ctx.type ~= swg.interface_rs485 then swg.tcpreset() end
 
-        print("Write failed(" .. result .. ") slave "
+        print("Write failed(" .. err .. ") slave "
                 .. ctx.curr_comm.device.slave .. " func code "
                 .. ctx.curr_comm.func_code .. " addr "
-                .. ctx_curr_comm.addr)
+                .. ctx.curr_comm.addr)
         ctx.err_cnt = ctx.err_cnt + 1
         if ctx.err_cnt < max_err_cnt then
             send_request(ctx, ctx.curr_comm.packet, ctx.curr_comm.device.timeout)
@@ -588,36 +654,37 @@ local function write_callback(ctx, result, data)
         else
             swg.timer(0, ctx.update_interval - (now - ctx.poll_ts), timer_callback)
         end
-    elseif result < 0 or not scan_commandable(ctx, ctx.curr_devidx, false) then
-        --give up when scan commandable point or scan finished
+    elseif err ~= nil or not scan_commandable(ctx, ctx.curr_devidx, false) then
+        --turn to next slave when retry failed or scan finished
         read_next(ctx)
     end
 end
 
 
-local function read_callback(ctx, result, data)
+local function read_callback(ctx, err, data)
     local device = ctx.devices[ctx.curr_devidx]
     local readreq = device.readreqs[ctx.curr_reqidx]
 
-    if result >= 0 then
-        if check_exception(data, device.slave, readreq[1]) ~= nil then
-            result = -1000
+    if err == nil then
+        local exception = check_exception(data, device.slave, readreq[1])
+        if exception ~= nil then
+            err = getExceptionMsg(exception)
         else
             data = check_read_rsp(data, device.slave, readreq[1], readreq[3])
             if data == nil then
-                result = -100
+                err = "parse response failed"
             end
         end
 
-        if result < 0 then
+        if err ~= nil then
             ctx.err_cnt = max_err_cnt
         end
     end
 
-    if result < 0 then
+    if err ~= nil then
         if ctx.type ~= swg.interface_rs485 then swg.tcpreset() end
 
-        print("Read failed(" .. result .. ") on device " .. ctx.curr_devidx
+        print("Read failed(" .. err .. ") on device " .. ctx.curr_devidx
                 .. " request " .. ctx.curr_reqidx)
         ctx.err_cnt = ctx.err_cnt + 1
         if device.fail_ts or ctx.err_cnt >= max_err_cnt then
@@ -671,8 +738,13 @@ end
 
 
 function once_callback(ctx, result, data)
-    if ctx.debug then
-        printpacket(data, result)
+    local err
+    if result < 0 then
+        if ctx.type == swg.interface_tcp then
+            err = getTCPErrorMsg(result)
+        else
+            err = getRS485ErrorMsg(result)
+        end
     end
 
     if result >= 0 then
@@ -682,23 +754,32 @@ function once_callback(ctx, result, data)
             data = verify_crc16(data)
         end
         if data == nil then
-            result = -100
+            err = "verify failed"
         end
     end
 
+    if ctx.debug then
+        printRxPacket(data, err)
+    end
+
     if ctx.curr_comm.is_read then
-        read_callback(ctx, result, data)
+        read_callback(ctx, err, data)
     else
-        write_callback(ctx, result, data)
+        write_callback(ctx, err, data)
     end
 end
 
 
 function tcp_callback(ctx, result, data)
+    local err
+    if result < 0 then
+        err = getTCPErrorMsg(result)
+    end
+
     if ctx.tcp_header == nil and result >= 0 then
         local length = decode_tcpheader(data, ctx.trans_id)
         if length == nil then
-            result = -100
+            err = "verify failed"
         else
             ctx.tcp_header = data
             local now = swg.now()
@@ -712,16 +793,16 @@ function tcp_callback(ctx, result, data)
 
     if ctx.debug then
         if ctx.tcp_header == nil then
-            printpacket(data, result)
+            printRxPacket(data, err)
         else
-            printpacket(ctx.tcp_header .. data, result)
+            printRxPacket(ctx.tcp_header .. data, err)
         end
     end
 
     if ctx.curr_comm.is_read then
-        read_callback(ctx, result, data)
+        read_callback(ctx, err, data)
     else
-        write_callback(ctx, result, data)
+        write_callback(ctx, err, data)
     end
 end
 
@@ -941,7 +1022,7 @@ function default_input(device, point)
 end
 
 
-function default_postoutput(device, point, value, output_reqs)
+function default_postoutput(device, point, _value, output_reqs)
     --return BACnet Value actually output
     for _, req in ipairs(output_reqs) do
         setmodbusdata(device.readreqs,
@@ -986,7 +1067,7 @@ function default_output(device, point, value)
     else
         if point.obj_type == 'm' then   --multistate
             value = point.tag.ms_values and point.tag.ms_values[value]
-                or (value - 1) 
+                or (value - 1)
         else    --analog
             if point.tag.datatype == 0 then     --unsigned
                 local max = ~(-1 << point.tag.bitlen)
