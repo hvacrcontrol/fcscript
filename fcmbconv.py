@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import tkinter as tk
 from tkinter import filedialog, messagebox
 import json
 import os
 import glob
+from typing import Optional
 
 MAX_JSON_FILE_LENGTH : int = 1024 * 1024
 RS485_TYPE = 1
@@ -39,10 +39,10 @@ def set_serial(cfg : dict, fc_cfg : dict)-> None:
     fc_cfg["tag"] = fc_cfg["tag"] + ",\n" +  ("ascii=true," if is_ascii else "")
 
 
-def set_points(cfg : dict, dev_cfg : dict)->tuple[list[(int, int, int)], tuple[bool, bool, bool]]:
-    """after set dev_cfg, return list of (func_code, 0 based start address, data length),
+def set_points(cfg : dict, dev_cfg : dict)->tuple[list[tuple[int, int, int, bool]], tuple[bool, bool, bool]]:
+    """after set dev_cfg, return list of (func_code, 0 based start address, data length, is_write_only),
      (has_single_register, has_big_integer_register, has_float_point_register)"""
-    used_address : list[(int, int, int)] = []
+    used_address : list[tuple[int, int, int, bool]] = []
     single_reg : bool = False
     bigint_reg : bool = False
     float_reg : bool = False
@@ -57,6 +57,7 @@ def set_points(cfg : dict, dev_cfg : dict)->tuple[list[(int, int, int)], tuple[b
                  "instance" : pnt["instance"]}
         fcpoints.append(fcpnt)
 
+        write_only: bool = False
         enable : bool = pnt["enable"]
         fcpnt["enable"] = enable
         object_type : str = pnt["object_type"]
@@ -117,7 +118,7 @@ def set_points(cfg : dict, dev_cfg : dict)->tuple[list[(int, int, int)], tuple[b
 
             if datatype[0] == "o":
                 messagebox.showinfo(None,\
-                        ("Point" if enable else "Disabled point: ") \
+                        ("Point: " if enable else "Disabled point: ") \
                             + pnt["name"] + " need script to translate")
             else:
                 tag = tag + ",\ndatatype=\"" + datatype + "\",\noffset="\
@@ -155,28 +156,32 @@ def set_points(cfg : dict, dev_cfg : dict)->tuple[list[(int, int, int)], tuple[b
 
                 tag = tag + "}"
 
-        if object_type[1] == "o" and "output_tolerance" in pnt\
-                and pnt["output_tolerance"]:
-            tag = tag + ",\nignore_unmatch=true"
+        if object_type[1] == "o":
+            if "output_tolerance" in pnt and pnt["output_tolerance"]:
+                tag = tag + ",\nignore_unmatch=true"
+            elif "write_only" in pnt and pnt["write_only"]:
+                tag = tag + ",\nignore_unmatch=true,\ninput=writeonly_input"
+                write_only = True
+
         fcpnt["tag"] = tag
 
         if enable:
-            used_address.append((func_code, address, datalen))
+            used_address.append((func_code, address, datalen, write_only))
 
     return used_address, (single_reg, bigint_reg, float_reg)
 
 
-def search_max_register(used_address : list[(int, int, int)])->int:
+def search_max_register(used_address : list[tuple[int, int, int, bool]])->int:
     max_len : int = 1
     for pnt in used_address:
-        if pnt[0] > 2 and pnt[2] > max_len:
+        if pnt[0] > 2 and pnt[2] > max_len and not pnt[3]:
             max_len = pnt[2]
 
     return max_len
 
 
-def get_readreqs(cfg : dict, used_address : list[(int, int, int)])->str:
-    readreqs : list[(int, int ,int)] = []
+def get_readreqs(cfg : dict, used_address : list[tuple[int, int, int, bool]])->str:
+    readreqs : list[tuple[int, int ,int]] = []
     used_address.sort(key = lambda pnt : pnt[0] * 100000 + pnt[1] - pnt[2]*0.0001)
 
     group_bit : int = cfg["group_bit"]
@@ -187,30 +192,52 @@ def get_readreqs(cfg : dict, used_address : list[(int, int, int)])->str:
     if max_regs > group_reg:
         group_reg = max_regs
 
-    prev : tuple[int, int, int] | None = None
+    write_only : Optional[tuple[int, int, int, bool]] = None
+    req : Optional[list[int]] = None
+    group: int
+    unused: int
+
     for pnt in used_address:
-        if prev is None:
-            prev = pnt
-            continue
+        if req is not None:
+            if pnt[0] != req[0]:
+                readreqs.append((req[0], req[1], req[2]))
+                req = None
+                write_only = None
+            else:
+                if pnt[3]:  #write only
+                    write_only = pnt
+                    continue
 
-        group : int
-        unused : int
-        if prev[0] <= 2:
-            group = group_bit
-            unused = unused_bit
+                if pnt[1] + pnt[2] <= req[1] + req[2]:
+                    # cover by previous req, do nothing
+                    continue
+
+                if (write_only is not None and pnt[1] > req[1] + req[2] and write_only[1] < pnt[1] \
+                            and write_only[1] + write_only[2] > req[1] + req[2]) \
+                        or pnt[1] + pnt[2] - req[1] > group \
+                        or pnt[1] - req[1] - req[2] > unused:
+                    readreqs.append((req[0], req[1], req[2]))
+                    req = None
+                else:
+                    req[2] = pnt[1] + pnt[2] - req[1]
+                    continue
+
+        if pnt[3]:    #write only
+            write_only = pnt
         else:
-            group = group_reg
-            unused = unused_reg
+            if write_only is not None and write_only[0] != pnt[0]:
+                write_only = None
 
-        if pnt[0]*100000 + pnt[1] + pnt[2] - prev[0]*100000 - prev[1] > group \
-                or pnt[1] - prev[1] - prev[2] > unused:
-            readreqs.append(prev)
-            prev = pnt
-        elif pnt[1] + pnt[2] > prev[1] + prev[2]:
-            prev = (prev[0], prev[1], pnt[1] + pnt[2] - prev[1])
+            req = [pnt[0], pnt[1], pnt[2]]
+            if pnt[0] <= 2:
+                group = group_bit
+                unused = unused_bit
+            else:
+                group = group_reg
+                unused = unused_reg
 
-    if prev is not None:
-        readreqs.append(prev)
+    if req is not None:
+        readreqs.append((req[0], req[1], req[2]))
 
     tag : str = "readreqs={"
     for req in readreqs:

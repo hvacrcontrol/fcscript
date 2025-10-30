@@ -32,7 +32,7 @@ local removed = {"debug", "os", "coroutine", "io", "file", "package", "collectga
 files["modbus.lua"] = {
     read_globals = {swg=swg},
     not_globals = removed,
-    globals = {"default_input", "default_output", "default_postoutput", "getmodbusdata", "setmodbusdata", "reorder_registers"},
+    globals = {"default_input", "default_output", "default_postoutput", "getmodbusdata", "setmodbusdata", "reorder_registers", "writeonly_input"},
 }
 
 files["mbus.lua"] = {

@@ -1,4 +1,8 @@
---Modbus v2.01, supports Modbus RTU, ASCII, TCP, RTU over TCP
+--Modbus, supports Modbus RTU, ASCII, TCP, RTU over TCP
+--v2.02: Support writeonly object:
+--      Add writeonly_input function, when there is active output command,
+--          return 0 as reliability, else return 6(NO_OUTPUT)
+--      Allow empty readreqs
 --Tag config:
 --bus:
 --  update_interval: milliseconds, default is 10000(10 seconds)
@@ -389,10 +393,16 @@ local function send_request(ctx, packet, timeout)
     end
 end
 
+local post_device_handle
 
 local function send_read_request(ctx)
     local device = ctx.devices[ctx.curr_devidx]
     local readreq = device.readreqs[ctx.curr_reqidx]
+    if #readreq == 0 then
+        swg.timer(0, 0, post_device_handle)
+        return
+    end
+
     ctx.curr_comm = {is_read=true, device=device}
     local packet = gen_read_req(device.slave,
         readreq[1], readreq[2], readreq[3])
@@ -534,8 +544,8 @@ function timer_callback(ctx)
         and default_postoutput or point.postoutput
 
     local output_value = postoutput(device, point, value, output_reqs)
-    point.last_output = output_value
-    if output_value == last_value then goto continue end
+    point.last_output = output_value == nil and value or output_value
+    if point.last_output == last_value then goto continue end
 
     ctx.err_cnt = 0
     send_write_request(ctx, device, point, output_reqs)
@@ -589,8 +599,8 @@ local function scan_commandable(ctx, devidx, start)
             and default_postoutput or point.postoutput
 
         local output_value = postoutput(device, point, value, output_reqs)
-        point.last_output = output_value
-        if output_value == last_value then goto continue end
+        point.last_output = output_value == nil and value or output_value
+        if point.last_output == last_value then goto continue end
 
         ctx.err_cnt = 0
         send_write_request(ctx, device, point, output_reqs)
@@ -661,6 +671,38 @@ local function write_callback(ctx, err, data)
 end
 
 
+function post_device_handle(ctx)
+    local device = ctx.devices[ctx.curr_devidx]
+
+    for pidx, point in ipairs(device.points) do
+        local input = point.input == nil and default_input or point.input
+
+        if not point.commandable then point.last_output = nil end
+
+        local value, reliability = input(device, point)
+        if point.last_output ~= nil and value ~= point.last_output
+                and reliability == 0 then
+            local ignore_unmatch
+            if point.ignore_unmatch ~= nil then
+                ignore_unmatch = point.ignore_unmatch
+            else
+                ignore_unmatch = device.ignore_unmatch
+            end
+
+            if not ignore_unmatch then reliability = 7 end
+        end
+
+        swg.updatepoint(ctx.curr_devidx, pidx, value, reliability)
+    end
+
+    if scan_commandable(ctx, ctx.curr_devidx, true) then
+        return
+    end
+
+    read_next(ctx)
+end
+
+
 local function read_callback(ctx, err, data)
     local device = ctx.devices[ctx.curr_devidx]
     local readreq = device.readreqs[ctx.curr_reqidx]
@@ -708,32 +750,7 @@ local function read_callback(ctx, err, data)
     swg.onoff(ctx.curr_devidx, true)
     device.fail_ts = nil
 
-    for pidx, point in ipairs(device.points) do
-        local input = point.input == nil and default_input or point.input
-
-        if not point.commandable then point.last_output = nil end
-
-        local value, reliability = input(device, point)
-        if point.last_output ~= nil and value ~= point.last_output
-                and reliability == 0 then
-            local ignore_unmatch
-            if point.ignore_unmatch ~= nil then
-                ignore_unmatch = point.ignore_unmatch
-            else
-                ignore_unmatch = device.ignore_unmatch
-            end
-
-            if not ignore_unmatch then reliability = 7 end
-        end
-
-        swg.updatepoint(ctx.curr_devidx, pidx, value, reliability)
-    end
-
-    if scan_commandable(ctx, ctx.curr_devidx, true) then
-        return
-    end
-
-    read_next(ctx)
+    post_device_handle(ctx)
 end
 
 
@@ -1107,24 +1124,17 @@ function default_output(device, point, value)
         output = reorder_registers(output)
     end
 
-    if point.obj_type == 'a' and point.tag.datatype ~= 3 then
-        --ananlog present_value is float, so 2 different BACnet values may map
-        --to same Modbus result, when the datatype is not float, check it
-        last = getmodbusdata(device.readreqs, point.tag.func_code,
-                point.tag.addr, (point.tag.bitlen + 15) // 16)
-        if output == last then return nil end
-    end
-
     return {{bits_in_last_byte, point.tag.addr, output}}
 end
+
+
+function writeonly_input(_, point)
+    return nil, point.last_output == nil and 6 or 0 end
 
 
 local function check_readreqs(readreqs)
     if readreqs == nil then
         error("readreqs not defined")
-    end
-    if #readreqs == 0 then
-        error("empty readreqs")
     end
 
     for _, req in ipairs(readreqs) do
@@ -1294,14 +1304,13 @@ local function init_point(point)
 
                 if tag.datatype == nil then
                     tag.datatype = "u16"
-                elseif tag.datatype == "s16" or tag.datatype == "u16" then
                 elseif tag.datatype == "s32" or tag.datatype == "u32"
                         or tag.datatype == "f32" then
                     tag.bitlen = 32
                 elseif tag.datatype == "s64" or tag.datatype == "u64"
                         or tag.datatype == "f64" then
                     tag.bitlen = 64
-                else
+                elseif tag.datatype ~= "s16" and tag.datatype ~= "u16" then
                     error("invalid datatype")
                 end
 
